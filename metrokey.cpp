@@ -1,3 +1,8 @@
+// MetroKey.cpp : Defines the entry point for the application.
+//
+
+#include "stdafx.h"
+#include "MetroKey.h"
 #include <windows.h>
 
 #ifndef WS_EX_NOACTIVATE
@@ -11,6 +16,15 @@
 #endif
 #ifndef DT_NOPREFIX
 #define DT_NOPREFIX 0x00000800
+#endif
+#ifndef SPI_SETWORKAREA
+#define SPI_SETWORKAREA 47
+#endif
+#ifndef SPI_GETWORKAREA
+#define SPI_GETWORKAREA 48
+#endif
+#ifndef SPIF_SENDCHANGE
+#define SPIF_SENDCHANGE 0x0002
 #endif
 
 #define GAP 3
@@ -121,6 +135,8 @@ static int   g_layer = LY_STD;
 static int   g_float = 0;                   /* 0=ドック 1=フロート */
 static int   g_min = 0, g_mpress = 0, g_mmoved = 0;  /* 最小化中 / 押下(1=KB 2=X) / ドラッグした */
 static int   g_mx = 0, g_my = 0, g_mvalid = 0;       /* ユーザーが動かしたタイル位置 */
+static RECT  g_work0;                       /* 起動時の作業領域 */
+static int   g_workSet = 0;                 /* 作業領域を縮めている間 1 */
 static int   g_fx = 0, g_fy = 0, g_fw = 0;  /* フロート時の位置と幅 */
 static int   g_shift = 0, g_ctrl = 0, g_alt = 0, g_caps = 0;
 static int   g_pr = -1, g_pc = -1;          /* 押下中のキー */
@@ -157,13 +173,29 @@ static void MakeFonts(void)
 }
 
 /* ウィンドウの位置・サイズを現在のモードに合わせて反映 */
+/* ドック中だけ作業領域をキーボードの上端までに縮め、それ以外は元に戻す */
+static void UpdateWork(void)
+{
+    RECT r;
+    if (g_drag == 3) return;                       /* ドック縦リサイズ中は離すまで更新しない */
+    if (!g_min && !g_float) {
+        r = g_work0;
+        r.bottom = g_work0.bottom - WinH();
+        SystemParametersInfo(SPI_SETWORKAREA, 0, &r, SPIF_SENDCHANGE);
+        g_workSet = 1;
+    } else if (g_workSet) {
+        SystemParametersInfo(SPI_SETWORKAREA, 0, &g_work0, SPIF_SENDCHANGE);
+        g_workSet = 0;
+    }
+}
+
 static void Relayout(void)
 {
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     int hgt = WinH(), w, x, y;
 
-    if (g_min) {                                   /* 最小化: 小さなタイル */
-                w = g_rowH * 3; hgt = TbH();                 /* [KB][X] ぶん幅を広げる */
+    if (g_min) {                                   /* 最小化: [KB][X] のタイル */
+        w = g_rowH * 3; hgt = TbH();
         if (g_mvalid)     { x = g_mx; y = g_my; }
         else if (g_float) { x = g_fx; y = g_fy; }
         else              { x = sw - w; y = sh - hgt; }
@@ -172,7 +204,7 @@ static void Relayout(void)
         if (x < 0) x = 0;
         if (y < 0) y = 0;
     } else if (g_float) {
-        if (g_fw < TbH() * 11) g_fw = TbH() * 11;  /* ボタンが1つ増えたので最小幅も拡大 */
+        if (g_fw < TbH() * 11) g_fw = TbH() * 11;
         if (g_fw > sw)         g_fw = sw;
         w = g_fw; x = g_fx; y = g_fy;
         if (x + w > sw)   x = sw - w;
@@ -180,10 +212,11 @@ static void Relayout(void)
         if (x < 0) x = 0;
         if (y < 0) y = 0;
         g_fx = x; g_fy = y;
-    } else {
-        w = sw; x = 0; y = sh - hgt;
+    } else {                                       /* ドック: 作業領域の下端に張り付く */
+        x = g_work0.left; w = g_work0.right - g_work0.left; y = g_work0.bottom - hgt;
     }
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, hgt, SWP_NOACTIVATE);
+    UpdateWork();
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
@@ -386,14 +419,13 @@ static void Paint(HWND h)
         SetTextColor(m, RGB(255,255,255));
         DrawText(m, TbLabel(i), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
-    if (g_float) {                               /* 移動ハンドル領域とリサイズグリップ */
-        GripRect(&cl, &gr);
-        DrawGrip(m, &gr);
-        TbRect(TB_N - 1, &rc);
-        hr.left = rc.right + GAP; hr.right = gr.left; hr.top = 0; hr.bottom = TbH();
-        SetTextColor(m, RGB(0x66,0x66,0x66));
-        DrawText(m, L"::::::", -1, &hr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    }
+    GripRect(&cl, &gr);
+    if (g_float) DrawGrip(m, &gr);                 /* 斜めグリップはフロートのみ */
+    TbRect(TB_N - 1, &rc);
+    hr.left = rc.right + GAP; hr.top = 0; hr.bottom = TbH();
+    hr.right = g_float ? gr.left : cl.right - GAP;
+    SetTextColor(m, RGB(0x66,0x66,0x66));
+    DrawText(m, L"::::::", -1, &hr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     /* ---- キー ---- */
     for (r = 0; r < L->nrows; r++)
@@ -510,7 +542,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (b >= 0) {
                 g_ptb = b; SetCapture(h);
                 InvalidateRect(h, NULL, FALSE);
-            } else if (g_float) {                          /* 空き領域=移動、右端=リサイズ */
+            } else {                                       /* 空き領域: フロート=移動/リサイズ、ドック=縦リサイズ */
                 RECT cl, gr, wr; POINT p;
                 GetClientRect(h, &cl); GripRect(&cl, &gr);
                 p.x = x; p.y = y;
@@ -518,7 +550,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 GetWindowRect(h, &wr);
                 g_dx0 = wr.left; g_dy0 = wr.top;
                 g_dw0 = wr.right - wr.left; g_dh0 = wr.bottom - wr.top;
-                g_drag = PtInRect(&gr, p) ? 2 : 1;
+                g_drag = g_float ? (PtInRect(&gr, p) ? 2 : 1) : 3;
                 SetCapture(h);
             }
             return 0;
@@ -531,10 +563,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_MOUSEMOVE:
-        if (g_drag) {
+                if (g_drag) {
             POINT p; int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
             p.x = x; p.y = y; ClientToScreen(h, &p);
-            if (g_drag == 1) {                             /* 移動 */
+            if (g_drag == 1) {                             /* フロート: 移動 */
                 int nx = g_dx0 + p.x - g_dp.x, ny = g_dy0 + p.y - g_dp.y;
                 if (nx > sw - g_fw)   nx = sw - g_fw;
                 if (ny > sh - WinH()) ny = sh - WinH();
@@ -542,9 +574,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 if (ny < 0) ny = 0;
                 g_fx = nx; g_fy = ny;
                 SetWindowPos(h, NULL, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            } else {                                       /* リサイズ */
+            } else if (g_drag == 2) {                      /* フロート: リサイズ */
                 int nw = g_dw0 + p.x - g_dp.x, nh = g_dh0 + p.y - g_dp.y;
                 g_fw   = nw;
+                g_rowH = nh * 4 / (LY()->nrows * 4 + 3);
+                ApplySize();
+            } else {                                       /* ドック: 縦リサイズ(上に引くと高くなる) */
+                int nh = g_dh0 - (p.y - g_dp.y);
                 g_rowH = nh * 4 / (LY()->nrows * 4 + 3);
                 ApplySize();
             }
@@ -557,7 +593,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_LBUTTONUP:
-        if (g_drag) { g_drag = 0; ReleaseCapture(); return 0; }
+        if (g_drag) {
+            int d = g_drag;
+            g_drag = 0; ReleaseCapture();
+            if (d == 3) UpdateWork();                      /* 縦リサイズを確定: 作業領域を1回だけ更新 */
+            return 0;
+        }
         if (g_ptb >= 0) {
             int b = g_ptb, same = (TbHit(x, y) == b);
             g_ptb = -1; ReleaseCapture();
@@ -580,6 +621,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
+        if (g_workSet)
+            SystemParametersInfo(SPI_SETWORKAREA, 0, &g_work0, SPIF_SENDCHANGE);
         DeleteObject(g_fMain); DeleteObject(g_fSmall);
         PostQuitMessage(0);
         return 0;
@@ -592,6 +635,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show)
     WNDCLASS wc; MSG msg;
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN), hgt;
 
+    if (!SystemParametersInfo(SPI_GETWORKAREA, 0, &g_work0, 0)) {   /* 取れなければ画面全体 */
+        g_work0.left = 0; g_work0.top = 0; g_work0.right = sw; g_work0.bottom = sh;
+    }
     g_rowH = sh / 10; ClampSize();
     hgt = WinH();
 
@@ -600,7 +646,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show)
     RegisterClass(&wc);
 
     g_hwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_NOACTIVATE, L"MetroKB", L"",
-                            WS_POPUP | WS_VISIBLE, 0, sh - hgt, sw, hgt, NULL, NULL, hi, NULL);
+                            WS_POPUP | WS_VISIBLE,
+                            g_work0.left, g_work0.bottom - hgt, g_work0.right - g_work0.left, hgt,
+                            NULL, NULL, hi, NULL);
+    UpdateWork();
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     return 0;
 }
