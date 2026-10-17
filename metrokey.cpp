@@ -26,6 +26,13 @@
 #ifndef SPIF_SENDCHANGE
 #define SPIF_SENDCHANGE 0x0002
 #endif
+#ifndef WM_DISPLAYCHANGE
+#define WM_DISPLAYCHANGE 0x007E
+#endif
+#ifndef WM_SETTINGCHANGE
+#define WM_SETTINGCHANGE 0x001A
+#endif
+#define TM_SCREEN 1
 
 #define GAP 3
 #define N(a) (sizeof(a)/sizeof(a[0]))
@@ -136,6 +143,11 @@ static int   g_float = 0;                   /* 0=ドック 1=フロート */
 static int   g_min = 0, g_mpress = 0, g_mmoved = 0;  /* 最小化中 / 押下(1=KB 2=X) / ドラッグした */
 static int   g_mx = 0, g_my = 0, g_mvalid = 0;       /* ユーザーが動かしたタイル位置 */
 static RECT  g_work0;                       /* 起動時の作業領域 */
+#define MKB_FORCE_RESIZE 1   /* 追従しないアプリを強制リサイズ。不要なら 0 */
+
+static int   g_curBottom = 0;               /* 現在設定している作業領域の下端 */
+static int   g_adjOld = 0, g_adjNew = 0;    /* 強制リサイズの旧/新の下端 */
+static int   g_scrW = 0, g_scrH = 0;        /* 直近に確認した画面サイズ */
 static int   g_workSet = 0;                 /* 作業領域を縮めている間 1 */
 static int   g_fx = 0, g_fy = 0, g_fw = 0;  /* フロート時の位置と幅 */
 static int   g_shift = 0, g_ctrl = 0, g_alt = 0, g_caps = 0;
@@ -174,18 +186,83 @@ static void MakeFonts(void)
 
 /* ウィンドウの位置・サイズを現在のモードに合わせて反映 */
 /* ドック中だけ作業領域をキーボードの上端までに縮め、それ以外は元に戻す */
+/* 旧作業領域の下端に接している全幅の通常ウィンドウを、新しい下端に合わせる */
+/* 強制リサイズした他ウィンドウの記録(元の矩形と、こちらが設定した矩形) */
+typedef struct { HWND h; RECT orig; RECT set; } ADJ;
+static ADJ g_adj[32];
+static int g_nadj = 0;
+static int g_adjTarget = 0;                        /* 今回の新しい下端 */
+
+/* キーボードに隠れる全幅ウィンドウを見つけて、下端をキーボードの上端に合わせる */
+static BOOL CALLBACK AdjustProc(HWND hw, LPARAM lp)
+{
+    RECT r; WCHAR cls[40]; LONG ex; int i;
+    if (hw == g_hwnd || !IsWindowVisible(hw)) return TRUE;
+    ex = GetWindowLong(hw, GWL_EXSTYLE);
+    if (ex & (WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)) return TRUE;   /* IMEなどは除外 */
+    GetClassName(hw, cls, 40);
+    if (lstrcmpi(cls, L"HHTaskBar") == 0 || lstrcmpi(cls, L"DesktopExplorerWindow") == 0) return TRUE;
+    GetWindowRect(hw, &r);
+    if (r.left > g_work0.left + 2 || r.right < g_work0.right - 2) return TRUE;      /* 全幅だけ */
+    if (r.bottom <= g_adjTarget + 1) return TRUE;                                   /* すでに収まっている */
+    if (r.top >= g_adjTarget - 40) return TRUE;                                     /* ほぼ全部が下にあるものは除外 */
+
+    for (i = 0; i < g_nadj; i++) if (g_adj[i].h == hw) break;
+    if (i == g_nadj) {                                                              /* 初めて動かす: 元の矩形を記録 */
+        if (g_nadj >= 32) return TRUE;
+        g_adj[g_nadj].h = hw; g_adj[g_nadj].orig = r; g_nadj++;
+    }
+    g_adj[i].set = r; g_adj[i].set.bottom = g_adjTarget;
+    SetWindowPos(hw, NULL, r.left, r.top, r.right - r.left, g_adjTarget - r.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    return TRUE;
+}
+
+/* newB: 新しい作業領域の下端。元の下端(g_work0.bottom)なら、記録したウィンドウを元に戻す */
+static void AdjustOthers(int oldB, int newB)
+{
+#if MKB_FORCE_RESIZE
+    int i, nb; RECT r;
+    g_adjTarget = newB;
+
+    /* 追跡中のウィンドウ: 設定したままの位置なら新しい下端へ。元の下端以上なら元に戻す */
+    for (i = g_nadj - 1; i >= 0; i--) {
+        if (!IsWindow(g_adj[i].h)) { g_adj[i] = g_adj[--g_nadj]; continue; }
+        GetWindowRect(g_adj[i].h, &r);
+        if (!EqualRect(&r, &g_adj[i].set)) {                  /* アプリやユーザーが動かした: 手を引く */
+            g_adj[i] = g_adj[--g_nadj]; continue;
+        }
+        nb = (newB >= g_adj[i].orig.bottom) ? g_adj[i].orig.bottom : newB;
+        SetWindowPos(g_adj[i].h, NULL, r.left, r.top, r.right - r.left, nb - r.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (nb == g_adj[i].orig.bottom) { g_adj[i] = g_adj[--g_nadj]; }   /* 元に戻した */
+        else                            { g_adj[i].set.bottom = nb; }
+    }
+
+    /* 新たにキーボードに隠れているウィンドウを探す(作業領域を縮めるときだけ) */
+    if (newB < g_work0.bottom) EnumWindows(AdjustProc, 0);
+#endif
+}
 static void UpdateWork(void)
 {
-    RECT r;
+    RECT r; int nb;
     if (g_drag == 3) return;                       /* ドック縦リサイズ中は離すまで更新しない */
     if (!g_min && !g_float) {
         r = g_work0;
         r.bottom = g_work0.bottom - WinH();
+        nb = r.bottom;
         SystemParametersInfo(SPI_SETWORKAREA, 0, &r, SPIF_SENDCHANGE);
         g_workSet = 1;
     } else if (g_workSet) {
+        nb = g_work0.bottom;
         SystemParametersInfo(SPI_SETWORKAREA, 0, &g_work0, SPIF_SENDCHANGE);
         g_workSet = 0;
+    } else {
+        return;
+    }
+    if (nb != g_curBottom) {                       /* 通知に反応しなかったウィンドウを強制的に追従させる */
+        AdjustOthers(g_curBottom, nb);
+        g_curBottom = nb;
     }
 }
 
@@ -227,6 +304,36 @@ static void SetLayer(int n)
     g_layer = n;
     g_shift = g_ctrl = g_alt = 0;
     Relayout();
+}
+
+/* 作業領域の「元の値」を取り直す: タスクバーの位置から求める */
+static void RefreshWork0(void)
+{
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    HWND tb = FindWindow(L"HHTaskBar", NULL);
+    RECT r;
+
+    g_work0.left = 0; g_work0.top = 0; g_work0.right = sw; g_work0.bottom = sh;
+    if (tb && IsWindowVisible(tb) && GetWindowRect(tb, &r)) {
+        if (r.top <= 0 && r.bottom < sh)      g_work0.top    = r.bottom;   /* 上端のタスクバー */
+        else if (r.bottom >= sh && r.top > 0) g_work0.bottom = r.top;      /* 下端のタスクバー */
+        return;
+    }
+    if (!g_workSet) SystemParametersInfo(SPI_GETWORKAREA, 0, &g_work0, 0); /* 見つからなければ現在値 */
+}
+
+/* 画面の向き(解像度)が変わったら、作業領域とキーボードの配置をやり直す */
+static void OnScreenChange(void)
+{
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw == g_scrW && sh == g_scrH) return;      /* 変化なし(自分のSPI通知もここで弾く) */
+    g_scrW = sw; g_scrH = sh;
+
+    RefreshWork0();
+    g_curBottom = g_work0.bottom;                  /* 回転後はOS側で作業領域がリセットされた前提 */
+    g_workSet = 1;        /* 旧向きの作業領域が残っているかもしれないので、必ず上書きさせる */
+    ClampSize();
+    Relayout();           /* ドックなら新しい作業領域を縮め直し、それ以外は元に戻す */
 }
 
 /* ---- ツールバー ---- */
@@ -480,7 +587,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     int r, c, x = (short)LOWORD(lp), y = (short)HIWORD(lp);
 
-        if (g_min && (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP)) {
+    /* ---- 最小化中: [KB][X] タイルの操作 ---- */
+    if (g_min && (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP)) {
         RECT cl; GetClientRect(h, &cl);
 
         if (msg == WM_LBUTTONDOWN) {
@@ -531,6 +639,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
+    case WM_DISPLAYCHANGE:
+    case WM_SETTINGCHANGE:
+        SetTimer(h, TM_SCREEN, 300, NULL);         /* 回転直後は不安定なので少し待つ */
+        return 0;
+    case WM_TIMER:
+        if (wp == TM_SCREEN) { KillTimer(h, TM_SCREEN); OnScreenChange(); }
+        return 0;
+
     case WM_CREATE:        MakeFonts(); return 0;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_ERASEBKGND:    return 1;
@@ -563,7 +679,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_MOUSEMOVE:
-                if (g_drag) {
+        if (g_drag) {
             POINT p; int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
             p.x = x; p.y = y; ClientToScreen(h, &p);
             if (g_drag == 1) {                             /* フロート: 移動 */
@@ -621,8 +737,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
-        if (g_workSet)
+        KillTimer(h, TM_SCREEN);
+        if (g_workSet) {                                   /* 作業領域と他ウィンドウの高さを元に戻す */
             SystemParametersInfo(SPI_SETWORKAREA, 0, &g_work0, SPIF_SENDCHANGE);
+            AdjustOthers(g_curBottom, g_work0.bottom);
+            g_workSet = 0;
+        }
         DeleteObject(g_fMain); DeleteObject(g_fSmall);
         PostQuitMessage(0);
         return 0;
@@ -638,6 +758,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show)
     if (!SystemParametersInfo(SPI_GETWORKAREA, 0, &g_work0, 0)) {   /* 取れなければ画面全体 */
         g_work0.left = 0; g_work0.top = 0; g_work0.right = sw; g_work0.bottom = sh;
     }
+    g_scrW = sw; g_scrH = sh;
+    g_curBottom = g_work0.bottom;
     g_rowH = sh / 10; ClampSize();
     hgt = WinH();
 
